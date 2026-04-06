@@ -96,15 +96,11 @@ DAG를 4개로 분리한 이유도 같다. 수집과 예측은 실행 시점과 
 
 | 원칙 | 적용 방식 | 이유 |
 |------|----------|------|
-| 수집과 파싱 분리 | API 응답 원본을 raw 스키마에 JSONB로 통째 보존, staging에서 정제 | 변환 로직이 바뀌어도 원본이 있으니 언제든 재처리 가능 |
-| Graceful Degradation | 개별 종목/API 실패해도 수집 계속, 부분 결과 반환 | 500개 중 3개 실패로 전체를 멈출 수 없다 |
-| 멱등성 보장 | `ON CONFLICT DO UPDATE` UPSERT 패턴, (date, ticker) 유니크 키 기준 | 같은 수집을 두 번 돌려도 데이터가 꼬이지 않는다 |
-| Rate Limiting | 뉴스 수집 시 1.5초 딜레이, 배치 단위 딜레이 + 지수 백오프 | API 차단 방지 |
-| 타임아웃 설정 | httpx 호출에 10~15초 타임아웃 | 응답 없는 API에 무한 대기하면 전체 파이프라인이 멈춘다 |
-| 의존성 버전 고정 | 핵심 라이브러리 7개 엄격 고정 (pandas==2.2.3 등) | 라이브러리 업데이트로 응답 구조가 바뀌는 사고 방지 |
-| 수집 건수 기록 | 모든 extractor에서 완료/실패/건수 로깅, 0건이면 Slack 알림 | 이상 감지의 기본. 몇 건 수집했는지 모르면 장애도 모른다 |
-| 수집 타임스탬프 | 모든 레코드에 `collected_at` UTC 기록 | "이 데이터가 언제 수집된 건지" 추적 |
-| 데이터 검증 | Great Expectations 스타일 validator (not_null, volume>=0 등) | 수집 직후 기본 품질 체크 |
+| 수집과 파싱 분리 | raw 스키마에 JSONB로 원본 보존, staging에서 정제 | 변환 로직이 바뀌어도 재처리 가능 |
+| Graceful Degradation | 개별 종목/API 실패해도 수집 계속 | 500개 중 3개 실패로 전체를 멈출 수 없다 |
+| 멱등성 보장 | UPSERT 패턴, (date, ticker) 유니크 키 | 같은 수집을 두 번 돌려도 데이터가 꼬이지 않는다 |
+| Rate Limiting | 배치 딜레이 + 지수 백오프 | API 차단 방지 |
+| 의존성 버전 고정 | 핵심 라이브러리 엄격 고정 | 라이브러리 업데이트로 응답 구조가 바뀌는 사고 방지 |
 
 ### 6개 소스, 역할 분담
 
@@ -323,40 +319,9 @@ raw를 보존하는 이유는 단순하다. 이전 프로젝트에서 파서를 
 
 staging과 mart를 분리한 이유는 관심사의 분리다. staging은 "정확하고 깨끗한 데이터", mart는 "AI 에이전트가 바로 소비할 수 있는 형태"다.
 
-### 뉴스 데이터 적재 예시
+뉴스 데이터도 같은 패턴이다. raw에 Naver/Tavily API 응답을 JSONB로 통째 저장하고, staging에서 감성 분석 점수와 뉴스 분류를 추출한다. 두 API의 응답 구조가 다르기 때문에 raw 단계에서 공통 스키마를 강제하지 않는다.
 
-```sql
--- raw: API 응답 원본
-CREATE TABLE raw.news_articles (
-    id SERIAL PRIMARY KEY,
-    date DATE NOT NULL,
-    ticker VARCHAR(10),
-    sector VARCHAR(50),
-    source VARCHAR(20),       -- 'naver' | 'tavily'
-    source_url TEXT,
-    raw_data JSONB NOT NULL,  -- API 응답 통째로
-    created_at TIMESTAMP DEFAULT NOW()
-);
-
--- staging: 정제 후
-CREATE TABLE staging.news_sentiment (
-    id SERIAL PRIMARY KEY,
-    date DATE NOT NULL,
-    ticker VARCHAR(10),
-    sector VARCHAR(50),
-    title TEXT,
-    source_url TEXT,
-    sentiment_score FLOAT,    -- 감성 분석 점수
-    category VARCHAR(50),     -- 뉴스 분류
-    created_at TIMESTAMP DEFAULT NOW()
-);
-```
-
-raw에 JSONB로 저장하는 이유: Naver API와 Tavily API의 응답 구조가 다르다. 공통 스키마로 강제하면 각 API의 고유 필드를 잃는다.
-
-JSONB로 통째 저장하고, staging 변환 단계에서 소스별 파서가 필요한 필드만 추출한다.
-
-### 시세 데이터 스키마
+### 스키마 예시
 
 ```sql
 CREATE TABLE staging.stock_prices (
@@ -466,53 +431,11 @@ def post_load_validation(execution_date):
 ```
 
 ```python
-from langgraph.graph import StateGraph, END
-from typing import TypedDict
-
-class DebateState(TypedDict):
-    market_data: dict
-    news_sentiment: dict
-    economic_data: dict
-    fundamental_data: dict
-    quant_analysis: str
-    qual_analysis: str
-    red_team_critique: str
-    final_judgment: str
-
-def quantitative_analyst(state: DebateState) -> DebateState:
-    prompt = f"""시세 데이터를 기술적 분석 관점에서 해석하라.
-    최근 20일 OHLCV: {state['market_data']}
-    RSI, MACD, 볼린저 밴드 관점에서 현재 시장 상태를 판단하라."""
-    state['quant_analysis'] = llm.invoke(prompt)
-    return state
-
-def red_team(state: DebateState) -> DebateState:
-    prompt = f"""다음 두 분석의 논리적 약점을 찾아라. 반론을 제기하라.
-    
-    정량 분석: {state['quant_analysis']}
-    정성 분석: {state['qual_analysis']}
-    
-    각 분석이 간과한 리스크, 논리적 비약, 데이터 해석의 오류를 지적하라."""
-    state['red_team_critique'] = llm.invoke(prompt)
-    return state
-
-def judge(state: DebateState) -> DebateState:
-    prompt = f"""정량 분석, 정성 분석, 그리고 반론을 모두 고려하여 최종 판단을 내려라.
-    
-    정량 분석: {state['quant_analysis']}
-    정성 분석: {state['qual_analysis']}
-    반론: {state['red_team_critique']}
-    
-    [강한 매수 / 매수 / 중립 / 매도 / 강한 매도] 중 선택하고,
-    근거를 3줄 이내로 설명하라."""
-    state['final_judgment'] = llm.invoke(prompt)
-    return state
-
 graph = StateGraph(DebateState)
-graph.add_node("quant", quantitative_analyst)
-graph.add_node("qual", qualitative_analyst)
-graph.add_node("red_team", red_team)
-graph.add_node("judge", judge)
+graph.add_node("quant", quantitative_analyst)   # 시세 + 기술적 지표
+graph.add_node("qual", qualitative_analyst)     # 뉴스 + 거시 + 재무
+graph.add_node("red_team", red_team)            # 반론 제기
+graph.add_node("judge", judge)                  # 최종 판단
 
 graph.set_entry_point("quant")
 graph.add_edge("quant", "qual")
@@ -522,6 +445,8 @@ graph.add_edge("judge", END)
 
 app = graph.compile()
 ```
+
+각 에이전트는 LLM을 호출하여 자신의 역할에 맞는 분석을 수행하고, 결과를 State에 저장한다. 다음 에이전트는 이전 분석 결과를 참조하여 자신의 분석을 진행한다.
 
 **왜 4개 에이전트인가**
 
@@ -636,26 +561,12 @@ Prometheus + Grafana를 별도로 구축한 이유는 Airflow UI만으로는 부
 
 ### 알람 체계
 
-```python
-def on_failure_callback(context):
-    task_id = context['task_instance'].task_id
-    exception = context.get('exception', 'Unknown')
-    execution_date = context['execution_date'].strftime('%Y-%m-%d')
-
-    send_slack_alert(
-        channel='#data-pipeline-alerts',
-        text=f":red_circle: *파이프라인 실패*\n"
-             f"Task: `{task_id}`\n"
-             f"Date: {execution_date}\n"
-             f"Error: {exception}\n"
-             f"<{context['task_instance'].log_url}|로그 확인>"
-    )
-```
+Airflow의 `on_failure_callback`으로 Task 실패 시 Slack에 자동 알림을 보낸다. 알림에는 실패한 Task 이름, 에러 메시지, Airflow 로그 링크를 포함한다.
 
 알림 원칙:
-- **실패 알림은 즉시, 성공 알림은 일일 리포트로 묶는다.** 매일 성공 알림이 오면 무시하게 된다.
-- **동일 에러 반복 알림은 1시간 내 1회로 제한한다.** 재시도 2회까지 3건의 알림이 연달아 오면 알림 피로가 생긴다.
-- **알림에 로그 링크를 포함한다.** Slack에서 바로 Airflow 로그로 점프할 수 있어야 대응 속도가 빠르다.
+- 실패 알림은 즉시, 성공 알림은 일일 리포트로 묶는다
+- 동일 에러 반복 알림은 1시간 내 1회로 제한한다
+- 알림에 로그 링크를 포함한다
 
 ### 실제 장애 사례
 
