@@ -27,7 +27,7 @@ tags: [airflow, data-pipeline, python, langgraph, llm, postgresql, monitoring, g
 
 ### 전체 아키텍처
 
-![전체 아키텍처](/assets/img/stock-pipeline-architecture.png)
+<!-- TODO: 아키텍처 이미지 추가 예정 -->
 
 | 컴포넌트 | 역할 | 선택 이유 |
 |---------|------|----------|
